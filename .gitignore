@@ -1,0 +1,9 @@
+.artifacts/
+.build/
+DerivedData/
+Vendor/*.xcframework/
+Vendor/*.zip
+Harness/ResumeData/
+*.xcresult
+.DS_Store
+

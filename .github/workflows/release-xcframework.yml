@@ -1,0 +1,28 @@
+name: Release XCFramework
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub release tag to receive binary artifacts
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify
+        run: Scripts/build-xcframework.sh
+      - name: Archive and checksum
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent Vendor/LibtorrentNative.xcframework LibtorrentNative.xcframework.zip
+          swift package compute-checksum LibtorrentNative.xcframework.zip > LibtorrentNative.xcframework.zip.sha256
+      - name: Attach to existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" LibtorrentNative.xcframework.zip LibtorrentNative.xcframework.zip.sha256 --clobber
+

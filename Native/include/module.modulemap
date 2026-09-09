@@ -1,0 +1,6 @@
+framework module LibtorrentNative {
+  umbrella header "LibtorrentNative.h"
+  export *
+  module * { export * }
+}
+
