@@ -51,26 +51,28 @@ Scripts/smoke-test.sh
 ```
 
 The build fetches only pinned inputs into ignored `.artifacts`, checks the tag,
-commit, and archive checksums, and creates:
+commit, and archive checksums, and creates local verification copies of:
 
 - `Vendor/LibtorrentNative.xcframework`: iOS arm64, Simulator arm64/x86_64,
   and macOS arm64/x86_64;
 - `Vendor/OpenSSL.xcframework`: checksum-verified binary dependency;
 - `Vendor/cacert-2026-08-13.pem`: checksum-verified CA bundle.
 
-These generated binaries are intentionally ignored. A fresh checkout must run
-the build script before SwiftPM can resolve the local binary targets. Client
-apps must copy the CA bundle into their protected application bundle and pass
-its file URL to `TorrentSessionConfiguration`.
+These generated binaries are intentionally ignored. Tagged releases resolve
+the checksum-pinned native release asset and upstream OpenSSL archive directly;
+consumers do not compile the C++ sources. Maintainers run the build script to
+reproduce and verify those artifacts. Client apps must copy the CA bundle into
+their protected application bundle and pass its file URL to
+`TorrentSessionConfiguration`.
 
 ## SwiftPM integration
 
-During local development, add `/path/to/LibtorrentKit` as a local package and
-link the `LibtorrentKit` product. Because the pinned OpenSSL XCFramework is a
-dynamic framework, also add `Vendor/OpenSSL.xcframework` to the application
-target's **Embed Frameworks** phase with **Embed & Sign**. The harness is the
-reference configuration. Normal client builds consume the prebuilt
-XCFrameworks and do not compile libtorrent's C++ sources.
+Add the package URL and link the `LibtorrentKit` product. Because the pinned
+OpenSSL XCFramework is a dynamic framework, also add the resolved
+`OpenSSL.xcframework` to the application target's **Embed Frameworks** phase
+with **Embed & Sign**. The harness is the reference configuration. Normal
+client builds consume the prebuilt XCFrameworks and do not compile
+libtorrent's C++ sources.
 
 ```swift
 let configuration = TorrentSessionConfiguration(caBundleURL: bundledCAURL)
@@ -165,11 +167,10 @@ ditto -c -k --sequesterRsrc --keepParent \
 swift package compute-checksum LibtorrentNative.xcframework.zip
 ```
 
-Attach the immutable zip to a GitHub release, then change the local binary
-target to `.binaryTarget(name:url:checksum:)` using that release URL and printed
-checksum. Publish OpenSSL as its own pinned binary target or retain the exact
-verified upstream artifact. The included workflow performs the archive and
-attachment step only when manually dispatched.
+Attach the immutable zip to a GitHub release, then update the native binary
+target URL and checksum for that tag. Update OpenSSL independently only after
+verifying its new upstream archive. The included workflow performs the archive
+and attachment step only when manually dispatched.
 
 ## Harness
 
