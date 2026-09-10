@@ -182,9 +182,13 @@ final class HarnessModel {
     @discardableResult
     private func updateWindow() async throws -> TorrentStreamingWindow {
         guard let session, let file = selectedFile else { throw HarnessError.noPayload }
+        let bytesPerSecond = max(file.size / (90 * 60), 1)
         let window = try await session.updateStreamingWindow(
             for: id, fileIndex: file.index, byteOffset: byteOffset,
-            forwardBufferBytes: 8 * 1_048_576, prioritizeFirstAndLastPieces: true
+            criticalBufferBytes: bytesPerSecond * 25,
+            warmBufferBytes: bytesPerSecond * 120,
+            consumptionBytesPerSecond: bytesPerSecond,
+            prioritizeFirstAndLastPieces: true
         )
         let pieces = try await session.pieces(for: id)
         windowDescription = "\(window.firstPieceIndex)...\(window.lastPieceIndex)"

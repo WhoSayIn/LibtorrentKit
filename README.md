@@ -104,7 +104,9 @@ let window = try await session.updateStreamingWindow(
     for: id,
     fileIndex: primary.index,
     byteOffset: 0,
-    forwardBufferBytes: 8 * 1_048_576,
+    criticalBufferBytes: 25 * 1_048_576,
+    warmBufferBytes: 120 * 1_048_576,
+    consumptionBytesPerSecond: 1_048_576,
     prioritizeFirstAndLastPieces: true
 )
 let pieces = try await session.pieces(for: id)
@@ -116,9 +118,10 @@ try await session.remove(id, deleteFiles: false)
 
 After a seek, call `updateStreamingWindow` with the new file-relative offset.
 The native layer clears old deadlines, reapplies file-priority baselines, raises
-the requested first/last pieces, builds a clamped new forward range, and assigns
-increasing deadlines. `clearStreamingWindow` removes all deadlines and restores
-file-selection priorities.
+the requested first/last pieces, deadlines only the critical window according
+to the supplied consumption rate, and gives the warm window high priority.
+Pieces beyond the warm window retain their normal selected-file policy.
+`clearStreamingWindow` removes all deadlines and restores file-selection priorities.
 
 To restore after relaunch, construct the same request with its original source,
 caller-owned UUID, download directory, selection, and the opaque `resumeData`.

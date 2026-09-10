@@ -180,7 +180,9 @@ public actor TorrentSession {
         for id: UUID,
         fileIndex: Int,
         byteOffset: Int64,
-        forwardBufferBytes: Int64,
+        criticalBufferBytes: Int64,
+        warmBufferBytes: Int64,
+        consumptionBytesPerSecond: Int64,
         prioritizeFirstAndLastPieces: Bool
     ) async throws -> TorrentStreamingWindow {
         guard let nativeFileIndex = Int32(exactly: fileIndex) else {
@@ -195,12 +197,15 @@ public actor TorrentSession {
             fileSize: file.size,
             pieceLength: currentMetadata.pieceLength,
             byteOffset: byteOffset,
-            forwardBufferBytes: forwardBufferBytes
+            criticalBufferBytes: criticalBufferBytes,
+            warmBufferBytes: warmBufferBytes,
+            consumptionBytesPerSecond: consumptionBytesPerSecond
         )
         return try decodeJSON(operation: .streamingWindow) { buffer in
             id.uuidString.withCString {
                 ltkit_session_update_streaming_window(
-                    native.pointer, $0, nativeFileIndex, byteOffset, forwardBufferBytes,
+                    native.pointer, $0, nativeFileIndex, byteOffset, criticalBufferBytes,
+                    warmBufferBytes, consumptionBytesPerSecond,
                     prioritizeFirstAndLastPieces, buffer
                 )
             }

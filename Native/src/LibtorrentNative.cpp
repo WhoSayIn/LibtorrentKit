@@ -225,6 +225,7 @@ struct ltkit_session {
                 auto found = jobs.find(*id);
                 if (found == jobs.end()) continue;
                 auto& value = found->second;
+                if (!value.handle.is_valid()) continue;
 
                 if (lt::alert_cast<lt::metadata_received_alert>(alert)) {
                     value.metadata_ready = true;
@@ -627,8 +628,11 @@ int32_t ltkit_session_pieces(ltkit_session_t* session, char const* identifier, l
 
 int32_t ltkit_session_update_streaming_window(
     ltkit_session_t* session, char const* identifier, int32_t file_index, int64_t byte_offset,
-    int64_t forward_bytes, bool prioritize_edges, ltkit_buffer_t* output) {
-    if (!session || !identifier || !output || file_index < 0 || byte_offset < 0 || forward_bytes < 0) return LTKIT_ERROR_INVALID_ARGUMENT;
+    int64_t critical_bytes, int64_t warm_bytes, int64_t consumption_bytes_per_second,
+    bool prioritize_edges, ltkit_buffer_t* output) {
+    if (!session || !identifier || !output || file_index < 0 || byte_offset < 0
+        || critical_bytes <= 0 || warm_bytes < critical_bytes || consumption_bytes_per_second <= 0)
+        return LTKIT_ERROR_INVALID_ARGUMENT;
     return guarded(session, [&] {
         std::lock_guard lock(session->mutex);
         auto* value = find_job(session, identifier);
@@ -649,9 +653,14 @@ int32_t ltkit_session_update_streaming_window(
         auto const file_first = static_cast<int>(files.piece_index_at_file(lt::file_index_t{file_index}));
         auto const file_last = static_cast<int>(files.last_piece_index_at_file(lt::file_index_t{file_index}));
         auto const playback = std::clamp(int((file_offset + byte_offset) / piece_length), file_first, file_last);
-        auto const bounded_end = forward_bytes == 0 ? byte_offset
-            : byte_offset + std::min<std::int64_t>(size - 1 - byte_offset, forward_bytes - 1);
-        auto const last = std::clamp(int((file_offset + bounded_end) / piece_length), playback, file_last);
+        auto const critical_end = byte_offset
+            + std::min<std::int64_t>(size - 1 - byte_offset, critical_bytes - 1);
+        auto const warm_end = byte_offset
+            + std::min<std::int64_t>(size - 1 - byte_offset, warm_bytes - 1);
+        auto const critical_last = std::clamp(
+            int((file_offset + critical_end) / piece_length), playback, file_last);
+        auto const warm_last = std::clamp(
+            int((file_offset + warm_end) / piece_length), critical_last, file_last);
 
         std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> raised;
         if (prioritize_edges) {
@@ -659,22 +668,31 @@ int32_t ltkit_session_update_streaming_window(
             if (file_last != file_first) raised.emplace_back(lt::piece_index_t{file_last}, lt::top_priority);
         }
         value->deadline_pieces.clear();
-        for (int piece = playback; piece <= last; ++piece) {
+        for (int piece = playback; piece <= warm_last; ++piece) {
+            raised.emplace_back(lt::piece_index_t{piece}, lt::download_priority_t{6});
+        }
+        for (int piece = playback; piece <= critical_last; ++piece) {
             raised.emplace_back(lt::piece_index_t{piece}, lt::top_priority);
-            value->handle.set_piece_deadline(lt::piece_index_t{piece}, 100 + (piece - playback) * 250);
+            auto const piece_file_offset = std::max<std::int64_t>(
+                std::int64_t(piece) * piece_length - file_offset, byte_offset);
+            auto const bytes_ahead = piece_file_offset - byte_offset;
+            auto const deadline = std::min<long double>(
+                100.0L + static_cast<long double>(bytes_ahead) * 1000.0L
+                    / static_cast<long double>(consumption_bytes_per_second),
+                std::numeric_limits<int>::max());
+            value->handle.set_piece_deadline(lt::piece_index_t{piece}, static_cast<int>(deadline));
             value->deadline_pieces.insert(piece);
         }
         value->handle.prioritize_pieces(raised);
-        value->handle.set_sequential_range(lt::piece_index_t{playback}, lt::piece_index_t{last});
         value->primary_file = file_index;
 
         std::ostringstream out;
         out << "{\"fileIndex\":" << file_index << ",\"requestedByteOffset\":" << byte_offset
-            << ",\"firstPieceIndex\":" << playback << ",\"lastPieceIndex\":" << last
+            << ",\"firstPieceIndex\":" << playback << ",\"lastPieceIndex\":" << warm_last
             << ",\"playbackPieceIndex\":" << playback << ",\"prioritizedPieceIndexes\":[";
-        for (int piece = playback; piece <= last; ++piece) { if (piece != playback) out << ','; out << piece; }
+        for (int piece = playback; piece <= warm_last; ++piece) { if (piece != playback) out << ','; out << piece; }
         out << "],\"deadlinePieceIndexes\":[";
-        for (int piece = playback; piece <= last; ++piece) { if (piece != playback) out << ','; out << piece; }
+        for (int piece = playback; piece <= critical_last; ++piece) { if (piece != playback) out << ','; out << piece; }
         out << "]}";
         return copy_buffer(out.str(), output) ? int32_t(LTKIT_OK)
             : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The streaming response could not be allocated.");

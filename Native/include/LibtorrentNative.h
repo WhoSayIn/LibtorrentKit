@@ -93,7 +93,9 @@ LTKIT_EXPORT int32_t ltkit_session_update_streaming_window(
     const char *identifier,
     int32_t file_index,
     int64_t byte_offset,
-    int64_t forward_buffer_bytes,
+    int64_t critical_buffer_bytes,
+    int64_t warm_buffer_bytes,
+    int64_t consumption_bytes_per_second,
     bool prioritize_edges,
     ltkit_buffer_t *out_json);
 LTKIT_EXPORT int32_t ltkit_session_clear_streaming_window(ltkit_session_t *session, const char *identifier);

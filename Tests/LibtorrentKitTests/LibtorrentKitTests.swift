@@ -5,29 +5,39 @@ import Testing
 @Test func mapsFileRelativeOffsetsToTorrentPieces() throws {
     let plan = try PieceWindowPlan.make(
         fileOffset: 1_000, fileSize: 2_000, pieceLength: 512,
-        byteOffset: 100, forwardBufferBytes: 800
+        byteOffset: 100, criticalBufferBytes: 400, warmBufferBytes: 800,
+        consumptionBytesPerSecond: 100
     )
     #expect(plan.firstPiece == 1)
     #expect(plan.playbackPiece == 2)
-    #expect(plan.lastPiece == 3)
+    #expect(plan.criticalLastPiece == 2)
+    #expect(plan.warmLastPiece == 3)
 }
 
 @Test func clampsForwardWindowAtEOFAndHandlesPartialEdges() throws {
     let plan = try PieceWindowPlan.make(
         fileOffset: 100, fileSize: 1_000, pieceLength: 256,
-        byteOffset: 999, forwardBufferBytes: 4_096
+        byteOffset: 999, criticalBufferBytes: 1_024, warmBufferBytes: 4_096,
+        consumptionBytesPerSecond: 100
     )
     #expect(plan.firstPiece == 0)
     #expect(plan.playbackPiece == 4)
-    #expect(plan.lastPiece == 4)
+    #expect(plan.criticalLastPiece == 4)
+    #expect(plan.warmLastPiece == 4)
 }
 
 @Test func rejectsEmptyFilesAndInvalidOffsets() {
     #expect(throws: TorrentError.self) {
-        try PieceWindowPlan.make(fileOffset: 0, fileSize: 0, pieceLength: 16, byteOffset: 0, forwardBufferBytes: 1)
+        try PieceWindowPlan.make(
+            fileOffset: 0, fileSize: 0, pieceLength: 16, byteOffset: 0,
+            criticalBufferBytes: 1, warmBufferBytes: 1, consumptionBytesPerSecond: 1
+        )
     }
     #expect(throws: TorrentError.self) {
-        try PieceWindowPlan.make(fileOffset: 0, fileSize: 16, pieceLength: 16, byteOffset: 16, forwardBufferBytes: 1)
+        try PieceWindowPlan.make(
+            fileOffset: 0, fileSize: 16, pieceLength: 16, byteOffset: 16,
+            criticalBufferBytes: 1, warmBufferBytes: 1, consumptionBytesPerSecond: 1
+        )
     }
 }
 
@@ -54,13 +64,15 @@ import Testing
     #expect(request.completionPolicy == .stopWithoutDeletingFiles)
 }
 
-@Test func handlesVeryLargeForwardBufferWithoutOverflow() throws {
+@Test func handlesVeryLargeWarmBufferWithoutOverflow() throws {
     let plan = try PieceWindowPlan.make(
         fileOffset: 0, fileSize: 32, pieceLength: 4,
-        byteOffset: 8, forwardBufferBytes: .max
+        byteOffset: 8, criticalBufferBytes: 4, warmBufferBytes: .max,
+        consumptionBytesPerSecond: 1
     )
     #expect(plan.playbackPiece == 2)
-    #expect(plan.lastPiece == 7)
+    #expect(plan.criticalLastPiece == 2)
+    #expect(plan.warmLastPiece == 7)
 }
 
 @Test func convertsNativeErrorEvents() throws {
@@ -112,14 +124,16 @@ func nativeSelectionSeekCheckpointAndCorruptResume() async throws {
     try await session.setPiecePriority(.high, forPieceAt: 0, in: id)
     let first = try await session.updateStreamingWindow(
         for: id, fileIndex: 0, byteOffset: 0,
-        forwardBufferBytes: 4, prioritizeFirstAndLastPieces: true
+        criticalBufferBytes: 4, warmBufferBytes: 4,
+        consumptionBytesPerSecond: 1, prioritizeFirstAndLastPieces: true
     )
     #expect(first.deadlinePieceIndexes == [0])
 
     try await session.selectFiles(for: id, selectedFileIndexes: [1], primaryFileIndex: 1)
     let second = try await session.updateStreamingWindow(
         for: id, fileIndex: 1, byteOffset: 4,
-        forwardBufferBytes: 4, prioritizeFirstAndLastPieces: false
+        criticalBufferBytes: 4, warmBufferBytes: 4,
+        consumptionBytesPerSecond: 1, prioritizeFirstAndLastPieces: false
     )
     let pieces = try await session.pieces(for: id)
     #expect(second.deadlinePieceIndexes == [3])
