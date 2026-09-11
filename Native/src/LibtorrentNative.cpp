@@ -93,6 +93,19 @@ bool copy_buffer(std::vector<char> const& source, ltkit_buffer_t* output) {
     return true;
 }
 
+bool copy_buffer(std::vector<std::uint8_t> const& source, ltkit_buffer_t* output) {
+    if (output == nullptr) return false;
+    output->data = nullptr;
+    output->size = 0;
+    if (source.empty()) return true;
+    auto* bytes = static_cast<std::uint8_t*>(std::malloc(source.size()));
+    if (bytes == nullptr) return false;
+    std::memcpy(bytes, source.data(), source.size());
+    output->data = bytes;
+    output->size = source.size();
+    return true;
+}
+
 bool copy_buffer(std::string const& source, ltkit_buffer_t* output) {
     return copy_buffer(std::vector<char>(source.begin(), source.end()), output);
 }
@@ -623,6 +636,29 @@ int32_t ltkit_session_pieces(ltkit_session_t* session, char const* identifier, l
         out << "]}";
         return copy_buffer(out.str(), output) ? int32_t(LTKIT_OK)
             : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The piece response could not be allocated.");
+    });
+}
+
+int32_t ltkit_session_piece_completion(
+    ltkit_session_t* session, char const* identifier, int32_t* piece_count, ltkit_buffer_t* output) {
+    if (!session || !identifier || !piece_count || !output) return LTKIT_ERROR_INVALID_ARGUMENT;
+    *piece_count = 0;
+    return guarded(session, [&] {
+        std::lock_guard lock(session->mutex);
+        auto* value = find_job(session, identifier);
+        if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
+        auto info = value->handle.torrent_file();
+        if (!info) return fail(session, LTKIT_ERROR_METADATA_UNAVAILABLE, "Torrent metadata is unavailable.");
+        auto const count = info->num_pieces();
+        std::vector<std::uint8_t> completed(std::size_t(count + 7) / 8, 0);
+        for (int i = 0; i < count; ++i) {
+            if (value->handle.have_piece(lt::piece_index_t{i})) {
+                completed[std::size_t(i) / 8] |= std::uint8_t(1u << (i % 8));
+            }
+        }
+        *piece_count = count;
+        return copy_buffer(completed, output) ? int32_t(LTKIT_OK)
+            : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The piece completion response could not be allocated.");
     });
 }
 

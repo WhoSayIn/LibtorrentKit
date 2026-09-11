@@ -88,6 +88,11 @@ LTKIT_EXPORT int32_t ltkit_session_start(ltkit_session_t *session, const char *i
 LTKIT_EXPORT int32_t ltkit_session_pause(ltkit_session_t *session, const char *identifier);
 LTKIT_EXPORT int32_t ltkit_session_status(ltkit_session_t *session, const char *identifier, ltkit_buffer_t *out_json);
 LTKIT_EXPORT int32_t ltkit_session_pieces(ltkit_session_t *session, const char *identifier, ltkit_buffer_t *out_json);
+LTKIT_EXPORT int32_t ltkit_session_piece_completion(
+    ltkit_session_t *session,
+    const char *identifier,
+    int32_t *out_piece_count,
+    ltkit_buffer_t *out_bitset);
 LTKIT_EXPORT int32_t ltkit_session_update_streaming_window(
     ltkit_session_t *session,
     const char *identifier,

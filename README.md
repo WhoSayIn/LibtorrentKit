@@ -111,6 +111,11 @@ let window = try await session.updateStreamingWindow(
 )
 let pieces = try await session.pieces(for: id)
 
+// Use the compact bitset for frequent readiness polling. The rich snapshot
+// above is intended for diagnostics that need availability or priority state.
+let completion = try await session.pieceCompletion(for: id)
+let firstPieceIsReady = completion.isComplete(pieceAt: 0)
+
 try await session.pause(id)
 let resumeData = try await session.checkpoint(id, flushDiskCache: true)
 try await session.remove(id, deleteFiles: false)

@@ -136,9 +136,14 @@ func nativeSelectionSeekCheckpointAndCorruptResume() async throws {
         consumptionBytesPerSecond: 1, prioritizeFirstAndLastPieces: false
     )
     let pieces = try await session.pieces(for: id)
+    let completion = try await session.pieceCompletion(for: id)
     #expect(second.deadlinePieceIndexes == [3])
     #expect(pieces.deadlinePieceIndexes == [3])
     #expect(pieces.priorities[0] == 0)
+    #expect(completion.pieceCount == metadata.pieceCount)
+    #expect(completion.completionBitset.count == (metadata.pieceCount + 7) / 8)
+    #expect(!completion.isComplete(pieceAt: -1))
+    #expect(!completion.isComplete(pieceAt: metadata.pieceCount))
 
     let checkpoint = try await session.checkpoint(id, flushDiskCache: true)
     #expect(!checkpoint.isEmpty)

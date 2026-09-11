@@ -176,6 +176,23 @@ public actor TorrentSession {
         }
     }
 
+    /// Returns completion-only piece state without constructing or decoding JSON.
+    public func pieceCompletion(for id: UUID) async throws -> TorrentPieceCompletion {
+        try ensureRunning(operation: .pieces)
+        var pieceCount: Int32 = 0
+        var buffer = ltkit_buffer_t(data: nil, size: 0)
+        let code = id.uuidString.withCString {
+            ltkit_session_piece_completion(native.pointer, $0, &pieceCount, &buffer)
+        }
+        try check(code, operation: .pieces)
+        let completionBitset = Self.takeData(&buffer) ?? Data()
+        let count = Int(pieceCount)
+        guard count >= 0, completionBitset.count == (count + 7) / 8 else {
+            throw TorrentError(operation: .pieces, code: .nativeFailure, description: "The native piece completion response was malformed.")
+        }
+        return TorrentPieceCompletion(pieceCount: count, completionBitset: completionBitset)
+    }
+
     public func updateStreamingWindow(
         for id: UUID,
         fileIndex: Int,
