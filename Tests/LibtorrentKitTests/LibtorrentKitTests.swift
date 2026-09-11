@@ -163,6 +163,40 @@ func nativeSelectionSeekCheckpointAndCorruptResume() async throws {
     #expect(FileManager.default.fileExists(atPath: directory.path))
 }
 
+@Test(.timeLimit(.minutes(1)))
+func cancellingMetadataWaitReturnsPromptly() async throws {
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let ca = root.appending(path: "Vendor/cacert-2026-08-13.pem")
+    let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let session = try TorrentSession(configuration: .init(
+        listenPortRange: 49_952...49_952,
+        enableDHT: false, enableLocalServiceDiscovery: false,
+        enableUPnP: false, enableNATPMP: false,
+        caBundleURL: ca, checkpointTimeout: .seconds(10)
+    ))
+    let id = UUID()
+    try await session.add(.init(
+        id: id,
+        source: .magnet(URL(string: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789")!),
+        downloadDirectory: directory,
+        beginsPaused: true
+    ))
+
+    let metadataTask = Task { try await session.metadata(for: id) }
+    try await Task.sleep(for: .milliseconds(100))
+    metadataTask.cancel()
+    do {
+        _ = try await metadataTask.value
+        Issue.record("Expected the metadata wait to be cancelled")
+    } catch is CancellationError {
+        // Expected.
+    }
+    await session.shutdown()
+}
+
 private enum BValue {
     case integer(Int)
     case bytes(Data)

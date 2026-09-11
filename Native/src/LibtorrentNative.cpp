@@ -172,6 +172,7 @@ struct ltkit_session {
     std::deque<std::string> events;
     std::string last_error;
     bool shutting_down = false;
+    std::uint64_t wake_generation = 0;
     std::thread alert_thread;
 
     void set_error(std::string value) {
@@ -398,6 +399,7 @@ int32_t ltkit_session_create(ltkit_session_configuration_t const* configuration,
 void ltkit_session_wake(ltkit_session_t* session) {
     if (!session) return;
     std::lock_guard lock(session->mutex);
+    ++session->wake_generation;
     session->condition.notify_all();
 }
 
@@ -495,10 +497,14 @@ int32_t ltkit_session_metadata(ltkit_session_t* session, char const* identifier,
         auto* value = find_job(session, identifier);
         if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
         if (!value->metadata_ready) {
+            auto const wake_generation = session->wake_generation;
             if (!session->condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
                 auto* current = find_job(session, identifier);
-                return session->shutting_down || !current || current->metadata_ready || current->stopped;
+                return session->shutting_down || session->wake_generation != wake_generation
+                    || !current || current->metadata_ready || current->stopped;
             })) return fail(session, LTKIT_ERROR_TIMED_OUT, "Metadata acquisition timed out.");
+            if (session->wake_generation != wake_generation && !session->shutting_down)
+                return fail(session, LTKIT_ERROR_TIMED_OUT, "Metadata acquisition was cancelled.");
             value = find_job(session, identifier);
         }
         if (!value || value->stopped || !value->handle.torrent_file())
@@ -760,12 +766,15 @@ int32_t ltkit_session_checkpoint(
         auto flags = lt::torrent_handle::save_info_dict;
         if (flush) flags |= lt::torrent_handle::flush_disk_cache;
         value->handle.save_resume_data(flags);
+        auto const wake_generation = session->wake_generation;
         auto const completed = session->condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
             auto* current = find_job(session, identifier);
-            return session->shutting_down || !current || current->checkpoint.done;
+            return session->shutting_down || session->wake_generation != wake_generation
+                || !current || current->checkpoint.done;
         });
         value = find_job(session, identifier);
-        if (!completed || !value) {
+        auto const interrupted = session->wake_generation != wake_generation;
+        if (!completed || interrupted || !value) {
             if (value) {
                 value->checkpoint.active = false;
                 if (value->completion_waiting) {
@@ -774,7 +783,8 @@ int32_t ltkit_session_checkpoint(
                     value->handle.save_resume_data(lt::torrent_handle::save_info_dict | lt::torrent_handle::flush_disk_cache);
                 }
             }
-            return fail(session, LTKIT_ERROR_TIMED_OUT, "The checkpoint request timed out.");
+            return fail(session, LTKIT_ERROR_TIMED_OUT,
+                interrupted ? "The checkpoint request was cancelled." : "The checkpoint request timed out.");
         }
         auto checkpoint = std::move(value->checkpoint);
         value->checkpoint = {};

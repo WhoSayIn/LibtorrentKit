@@ -16,6 +16,13 @@ The package has three layers:
 3. The Swift `TorrentSession` actor serializes control and exposes value types
    and `AsyncStream<TorrentEvent>`.
 
+Swift calls run on one dedicated serial native-operation lane. Metadata and
+checkpoint waits therefore do not block Swift's cooperative executor, while
+cancellation and shutdown wake the native condition waits before the lane is
+drained. Immutable torrent/file geometry is cached after metadata arrives so
+streaming-window updates validate offsets without fetching and decoding the
+full metadata document again.
+
 The C ABI catches every C++ exception and owns all returned buffers. C++ types
 never enter Swift, avoiding Swift C++ interoperability and upstream C++ ABI
 coupling. The native alert thread collects metadata, state, piece, completion,
