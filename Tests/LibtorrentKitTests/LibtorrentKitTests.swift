@@ -204,16 +204,16 @@ private enum BValue {
     case dictionary([String: BValue])
 }
 
-private func makeTwoFileTorrent() -> Data {
+func makeTwoFileTorrent(firstFileSize: Int = 8) -> Data {
     encode(.dictionary([
         "info": .dictionary([
             "files": .list([
-                .dictionary(["length": .integer(8), "path": .list([.bytes(Data("a.bin".utf8))])]),
+                .dictionary(["length": .integer(firstFileSize), "path": .list([.bytes(Data("a.bin".utf8))])]),
                 .dictionary(["length": .integer(8), "path": .list([.bytes(Data("b.bin".utf8))])]),
             ]),
             "name": .bytes(Data("fixture".utf8)),
             "piece length": .integer(4),
-            "pieces": .bytes(Data(repeating: 0, count: 80)),
+            "pieces": .bytes(Data(repeating: 0, count: ((firstFileSize + 8 + 3) / 4) * 20)),
         ]),
     ]))
 }

@@ -1,118 +1,6 @@
 import Foundation
 @preconcurrency import LibtorrentNative
 
-final class NativeSessionHandle: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: OpaquePointer?
-    var pointer: OpaquePointer {
-        lock.withLock { storage! }
-    }
-    var optionalPointer: OpaquePointer? { lock.withLock { storage } }
-    init(_ pointer: OpaquePointer) { self.storage = pointer }
-
-    func destroy() {
-        let value = lock.withLock {
-            let value = storage
-            storage = nil
-            return value
-        }
-        if let value { ltkit_session_destroy(value) }
-    }
-
-    func wake() {
-        lock.withLock { if let storage { ltkit_session_wake(storage) } }
-    }
-
-    deinit { destroy() }
-}
-
-private final class NativeOperationCancellation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-    private var running = false
-
-    func begin() -> Bool {
-        lock.withLock {
-            guard !cancelled else { return false }
-            running = true
-            return true
-        }
-    }
-
-    func finish() { lock.withLock { running = false } }
-
-    func cancel() -> Bool {
-        lock.withLock {
-            cancelled = true
-            return running
-        }
-    }
-    var isCancelled: Bool { lock.withLock { cancelled } }
-}
-
-final class NativeSessionExecutor: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "LibtorrentKit.NativeSession", qos: .utility)
-    private let native: NativeSessionHandle
-
-    init(native: NativeSessionHandle) {
-        self.native = native
-    }
-
-    func perform<Result: Sendable>(
-        _ operation: @escaping @Sendable (OpaquePointer) throws -> Result
-    ) async throws -> Result {
-        try Task.checkCancellation()
-        let cancellation = NativeOperationCancellation()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                queue.async { [native] in
-                    guard cancellation.begin() else {
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    defer { cancellation.finish() }
-                    guard let pointer = native.optionalPointer else {
-                        continuation.resume(throwing: TorrentError(
-                            operation: .shutdown,
-                            code: .sessionShutDown,
-                            description: "The torrent session has shut down."
-                        ))
-                        return
-                    }
-                    do {
-                        let result = try operation(pointer)
-                        if cancellation.isCancelled {
-                            continuation.resume(throwing: CancellationError())
-                        } else {
-                            continuation.resume(returning: result)
-                        }
-                    } catch {
-                        continuation.resume(throwing: cancellation.isCancelled ? CancellationError() : error)
-                    }
-                }
-            }
-        } onCancel: { [native] in
-            if cancellation.cancel() { native.wake() }
-        }
-    }
-
-    func drain() async {
-        await withCheckedContinuation { continuation in
-            queue.async { continuation.resume() }
-        }
-    }
-
-    func shutdown() async {
-        native.wake()
-        await withCheckedContinuation { continuation in
-            queue.async { [native] in
-                native.destroy()
-                continuation.resume()
-            }
-        }
-    }
-}
-
 private struct TorrentGeometry: Sendable {
     struct File: Sendable {
         let offset: Int64
@@ -130,6 +18,9 @@ private struct TorrentGeometry: Sendable {
     }
 }
 
+/// Mutations may abort before native execution. Once execution starts, they return
+/// the native outcome despite cancellation, allowing callers to reconcile committed
+/// state. Reads and checkpoint waits remain cancellable.
 public actor TorrentSession {
     /// A single-consumer, demand-driven stream. Lifecycle/error events remain
     /// in the bounded native mailbox until read; status is latest per torrent.
@@ -145,6 +36,13 @@ public actor TorrentSession {
     private var geometry = [UUID: TorrentGeometry]()
 
     public init(configuration: TorrentSessionConfiguration) throws {
+        try self.init(configuration: configuration, nativeOperationBoundary: nil)
+    }
+
+    init(
+        configuration: TorrentSessionConfiguration,
+        nativeOperationBoundary: (@Sendable (NativeSessionExecutor.OperationBoundary) -> Void)?
+    ) throws {
         guard configuration.caBundleURL.isFileURL,
               FileManager.default.isReadableFile(atPath: configuration.caBundleURL.path) else {
             throw TorrentError(operation: .initialize, code: .invalidArgument, description: "The CA bundle is not a readable local file.")
@@ -170,7 +68,7 @@ public actor TorrentSession {
         }
         let native = NativeSessionHandle(pointer)
         self.native = native
-        self.nativeExecutor = NativeSessionExecutor(native: native)
+        self.nativeExecutor = NativeSessionExecutor(native: native, operationBoundary: nativeOperationBoundary)
         let components = configuration.checkpointTimeout.components
         let milliseconds = components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
         self.checkpointTimeoutMilliseconds = Int32(clamping: milliseconds)
@@ -193,7 +91,7 @@ public actor TorrentSession {
            request.selectedFileIndexes?.contains(primary) == false {
             throw TorrentError(operation: .add, code: .invalidFileIndex, description: "The primary file must be selected.")
         }
-        try await nativeExecutor.perform { pointer in
+        try await nativeExecutor.perform(semantics: .mutation) { pointer in
             try Self.withSourceBytes(source) { sourceKind, sourceBytes in
                 try request.resumeData.withOptionalUnsafeBytes { resumeBytes in
                     try selected.withUnsafeBufferPointer { selectedBuffer in
@@ -237,7 +135,7 @@ public actor TorrentSession {
             throw TorrentError(operation: .selection, code: .invalidFileIndex, description: "The primary file must be selected.")
         }
         try ensureRunning(operation: .selection)
-        try await nativeExecutor.perform { pointer in
+        try await nativeExecutor.perform(semantics: .mutation) { pointer in
             try indexes.withUnsafeBufferPointer { values in
                 let code = id.uuidString.withCString {
                     ltkit_session_select_files(pointer, $0, values.baseAddress, values.count, Int32(primaryFileIndex ?? -1))
@@ -252,7 +150,7 @@ public actor TorrentSession {
             throw TorrentError(operation: .priority, code: .invalidFileIndex, description: "The file index is outside the supported range.")
         }
         try ensureRunning(operation: .priority)
-        try await nativeExecutor.perform { pointer in
+        try await nativeExecutor.perform(semantics: .mutation) { pointer in
             let code = id.uuidString.withCString {
                 ltkit_session_set_file_priority(pointer, $0, index, priority.rawValue)
             }
@@ -265,7 +163,7 @@ public actor TorrentSession {
             throw TorrentError(operation: .priority, code: .invalidPieceIndex, description: "The piece index is outside the supported range.")
         }
         try ensureRunning(operation: .priority)
-        try await nativeExecutor.perform { pointer in
+        try await nativeExecutor.perform(semantics: .mutation) { pointer in
             let code = id.uuidString.withCString {
                 ltkit_session_set_piece_priority(pointer, $0, index, priority.rawValue)
             }
@@ -344,7 +242,7 @@ public actor TorrentSession {
             warmBufferBytes: warmBufferBytes,
             consumptionBytesPerSecond: consumptionBytesPerSecond
         )
-        return try await nativeExecutor.perform { pointer in
+        return try await nativeExecutor.perform(semantics: .mutation) { pointer in
             try Self.decodeJSON(operation: .streamingWindow, pointer: pointer) { buffer in
                 id.uuidString.withCString {
                     ltkit_session_update_streaming_window(
@@ -417,7 +315,7 @@ public actor TorrentSession {
         _ function: @escaping @Sendable (OpaquePointer?, UnsafePointer<CChar>?) -> Int32
     ) async throws {
         try ensureRunning(operation: operation)
-        try await nativeExecutor.perform { pointer in
+        try await nativeExecutor.perform(semantics: .mutation) { pointer in
             let code = id.uuidString.withCString { function(pointer, $0) }
             try Self.check(code, operation: operation, pointer: pointer)
         }

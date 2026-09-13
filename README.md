@@ -23,6 +23,13 @@ drained. Immutable torrent/file geometry is cached after metadata arrives so
 streaming-window updates validate offsets without fetching and decoding the
 full metadata document again.
 
+Mutating calls (add/remove, file selection, start/pause, priorities, and streaming
+windows) may throw `CancellationError` before native execution. Once execution
+starts, they deliver the native result even if the Swift task is cancelled, so
+session identifiers, cached geometry, and caller state can reflect committed
+success. Native failures are preserved as well. Reads and metadata/checkpoint
+waits remain fully cancellable; cancelling a mutation does not wake native waits.
+
 The C ABI catches every C++ exception and owns all returned buffers. C++ types
 never enter Swift, avoiding Swift C++ interoperability and upstream C++ ABI
 coupling. The native alert thread collects metadata, state, piece, completion,
@@ -232,6 +239,9 @@ Attach the immutable zip to a GitHub release, then update the native binary
 target URL and checksum for that tag. Update OpenSSL independently only after
 verifying its new upstream archive. The included workflow performs the archive
 and attachment step only when manually dispatched.
+
+Swift-only patch releases may reuse the existing immutable native asset URL and
+checksum when the C ABI and native implementation are unchanged.
 
 ## Harness
 
