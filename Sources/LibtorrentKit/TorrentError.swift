@@ -22,6 +22,7 @@ public struct TorrentError: Error, Sendable, Codable, Equatable, CustomStringCon
         case sessionShutDown = 13
         case allocationLimit = 14
         case pathViolation = 15
+        case completionFailed = 16
 
         init(native: Int32) { self = Self(rawValue: native) ?? .unknown }
     }

@@ -140,13 +140,31 @@ caller-owned UUID, download directory, selection, and the opaque `resumeData`.
 Corrupt or incompatible resume data fails recoverably and payload files are not
 deleted. libtorrent reconciles files already present in the save directory.
 
-Default completion policy is `.stopWithoutDeletingFiles`. On selected-payload
-completion, the bridge emits a completed status, pauses, requests resume data
-with a disk-cache flush, removes the torrent without delete flags, then emits
-`stoppedAfterCompletion`. Its cached status reports zero upload rate, zero
-peers, and no swarm participation. Final selected-file metadata also remains
-readable until explicit removal, even if the event consumer was delayed.
-Explicit `.seed` is opt-in.
+Default completion policy is `.stopWithoutDeletingFiles`. A 100% status is
+progress only. The bridge pauses the handle, waits for the explicit
+`flush_cache()` / `cache_flushed_alert` disk fence, then saves resume data.
+The pinned upstream implementation can post `save_resume_data_alert` before
+an asynchronous `flush_disk_cache` request finishes, so that flag alone is
+not the completion barrier. Unsolicited storage alerts are disabled to avoid
+mistaking an older automatic flush for the explicit fence.
+
+Before publishing `completed`, the bridge refreshes metadata and verifies the
+size, regular-file status, and `fsync` result of **every selected payload**
+(excluding torrent pad files). Missing/incomplete payloads get one more disk
+fence and metadata/filesystem check. Failure emits `completionFailed` and
+tears down without a successful completion or `stoppedAfterCompletion` event.
+Success publishes `completed`, removes the handle without deleting files,
+then publishes `stoppedAfterCompletion`. Cached final status, metadata, and
+resume data remain available until explicit `remove`; a flushed checkpoint
+on that stopped snapshot also reopens and syncs every selected payload.
+
+Its cached status reports zero upload rate, zero peers, and no swarm
+participation. Explicit `.seed` remains opt-in and keeps its existing policy
+(no automatic stop/completion events). Callers synthesizing selected-file
+completion for retained handles must pause, await `checkpoint(flushDiskCache:
+true)`, and verify all selected files before publishing their own completion.
+Timed-out or cancelled checkpoint requests retain their native reply slot
+until it drains, so late alerts cannot satisfy another request.
 
 `events` is a single-consumer, demand-driven stream: Swift does not buffer or
 evict native events. The native mailbox retains lifecycle transitions and

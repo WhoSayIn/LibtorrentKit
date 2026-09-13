@@ -21,8 +21,8 @@ let package = Package(
             path: "Vendor/LibtorrentNative.xcframework"
         ) : .binaryTarget(
             name: "LibtorrentNative",
-            url: "https://github.com/WhoSayIn/LibtorrentKit/releases/download/v0.5.0/LibtorrentNative.xcframework.zip",
-            checksum: "efd1b8a72106184f2a42ca6ef704c93f0db7f93af872887075cc21168969d028"
+            url: "https://github.com/WhoSayIn/LibtorrentKit/releases/download/v0.5.1/LibtorrentNative.xcframework.zip",
+            checksum: "418689f38e68f1fe324576b5482a55dd8338a72ee1d249103acde480bc7dce94"
         ),
         .binaryTarget(
             name: "OpenSSL",

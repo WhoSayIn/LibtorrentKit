@@ -1,5 +1,7 @@
 #include "LibtorrentNative.h"
 #include "EventMailbox.hpp"
+#include "DiskCheckpoint.hpp"
+#include "SelectedPayload.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -143,6 +145,7 @@ std::string status_json(lt::torrent_status const& status, bool stopped = false) 
 struct ltkit_session {
     struct checkpoint_state {
         bool active = false;
+        ltkit::DiskCheckpoint barrier;
         bool done = false;
         int32_t error = LTKIT_OK;
         std::vector<char> data;
@@ -158,6 +161,9 @@ struct ltkit_session {
         bool completion_stops = true;
         bool completion_checkpoint = false;
         bool completion_waiting = false;
+        bool completion_rechecked = false;
+        std::vector<char> final_resume_data;
+        std::vector<ltkit::SelectedPayload> final_payloads;
         bool stopped = false;
         std::optional<lt::torrent_status> final_status;
         std::string final_metadata;
@@ -176,6 +182,21 @@ struct ltkit_session {
     std::thread alert_thread;
 
     void cache_final_metadata(job& value);
+    bool refresh_selected_payloads(job& value);
+    void finish_checkpoint(std::string const& id, job& value, bool success);
+
+    void start_checkpoint(job& value, bool flush) {
+        value.checkpoint.barrier.begin(flush);
+        if (flush) value.handle.flush_cache();
+        else value.handle.save_resume_data(lt::torrent_handle::save_info_dict);
+    }
+
+    void start_waiting_completion(job& value) {
+        if (!value.completion_waiting || value.checkpoint.active || !value.checkpoint.barrier.idle()) return;
+        value.completion_waiting = false;
+        value.completion_checkpoint = true;
+        start_checkpoint(value, true);
+    }
 
     void set_error(std::string value) {
         std::lock_guard lock(mutex);
@@ -255,43 +276,32 @@ struct ltkit_session {
                     }
                     condition.notify_all();
                 } else if (lt::alert_cast<lt::torrent_finished_alert>(alert) && value.completion_stops
-                    && !value.final_status && value.handle.status().total_wanted > 0) {
-                    auto status = value.handle.status();
-                    value.final_status = status;
-                    cache_final_metadata(value);
-                    enqueue(*id, ltkit::EventMailbox::Kind::completed, "{\"kind\":\"completed\",\"id\":\"" + *id + "\",\"status\":" + status_json(status) + "}");
+                    && !value.final_status && !value.completion_checkpoint && !value.completion_waiting
+                    && !value.stopped && value.handle.status().total_wanted > 0
+                    && value.handle.status().is_finished) {
                     value.handle.pause();
-                    if (!value.checkpoint.active) {
-                        value.completion_checkpoint = true;
-                        value.handle.save_resume_data(lt::torrent_handle::save_info_dict | lt::torrent_handle::flush_disk_cache);
-                    } else value.completion_waiting = true;
+                    value.completion_waiting = true;
+                    start_waiting_completion(value);
+                } else if (lt::alert_cast<lt::cache_flushed_alert>(alert)) {
+                    if (value.checkpoint.barrier.cache_flushed()) {
+                        value.handle.save_resume_data(lt::torrent_handle::save_info_dict);
+                    }
                 } else if (auto const* resume = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
-                    auto data = lt::write_resume_data_buf(resume->params);
-                    if (value.checkpoint.active) {
-                        value.checkpoint.data = std::move(data);
-                        value.checkpoint.done = true;
-                        value.checkpoint.error = LTKIT_OK;
-                    } else if (value.completion_checkpoint) {
-                        engine->remove_torrent(value.handle);
-                        value.completion_checkpoint = false;
-                        value.stopped = true;
-                        enqueue(*id, ltkit::EventMailbox::Kind::stopped, "{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
+                    if (value.checkpoint.barrier.resume_saved()) {
+                        value.checkpoint.data = lt::write_resume_data_buf(resume->params);
+                        finish_checkpoint(*id, value, true);
                     }
-                    condition.notify_all();
                 } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(alert)) {
-                    if (value.checkpoint.active) {
-                        value.checkpoint.done = true;
+                    if (value.checkpoint.barrier.fail()) finish_checkpoint(*id, value, false);
+                } else if (lt::alert_cast<lt::torrent_error_alert>(alert)
+                    || lt::alert_cast<lt::file_error_alert>(alert)) {
+                    if (value.checkpoint.barrier.pending()) {
+                        // Keep the pending request alive until its reply drains.
                         value.checkpoint.error = LTKIT_ERROR_NATIVE_FAILURE;
-                    } else if (value.completion_checkpoint) {
-                        engine->remove_torrent(value.handle);
-                        value.completion_checkpoint = false;
-                        value.stopped = true;
-                        enqueue(*id, ltkit::EventMailbox::Kind::stopped, "{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
+                    } else {
+                        enqueue(*id, ltkit::EventMailbox::Kind::error, "{\"kind\":\"error\",\"id\":\"" + *id
+                            + "\",\"code\":12,\"description\":\"The torrent engine reported a recoverable error.\"}");
                     }
-                    condition.notify_all();
-                } else if (lt::alert_cast<lt::torrent_error_alert>(alert)) {
-                    enqueue(*id, ltkit::EventMailbox::Kind::error, "{\"kind\":\"error\",\"id\":\"" + *id
-                        + "\",\"code\":12,\"description\":\"The torrent engine reported a recoverable error.\"}");
                 } else if (lt::alert_cast<lt::state_changed_alert>(alert)) {
                     events.status(*id, "{\"kind\":\"statusChanged\",\"id\":\"" + *id
                         + "\",\"status\":" + status_json(value.handle.status(), value.stopped) + "}");
@@ -376,6 +386,71 @@ void ltkit_session::cache_final_metadata(job& value) {
     if (safe) value.final_metadata = std::move(metadata);
 }
 
+bool ltkit_session::refresh_selected_payloads(job& value) {
+    value.final_payloads.clear();
+    auto info = value.handle.torrent_file();
+    if (!info) return false;
+    auto const& files = info->layout();
+    auto const save_path = value.handle.status().save_path;
+    auto const progress = value.handle.file_progress(lt::torrent_handle::piece_granularity);
+    for (auto const index : value.desired_files) {
+        if (index < 0 || index >= files.num_files()) return false;
+        auto const file = lt::file_index_t{index};
+        if (files.pad_file_at(file)) continue;
+        std::string path;
+        if (!safe_relative_path(files, file, path) || std::size_t(index) >= progress.size()
+            || progress[std::size_t(index)] < files.file_size(file)) return false;
+        value.final_payloads.push_back({(std::filesystem::path(save_path) / path).string(), files.file_size(file)});
+    }
+    return ltkit::sync_selected_payloads(value.final_payloads);
+}
+
+void ltkit_session::finish_checkpoint(std::string const& id, job& value, bool success) {
+    success = success && value.checkpoint.error == LTKIT_OK;
+    if (value.completion_checkpoint) {
+        char const* failure_description = "Torrent completion failed: the final disk checkpoint did not succeed.";
+        if (success && !refresh_selected_payloads(value)) {
+            if (!value.completion_rechecked) {
+                // One explicit disk fence plus fresh metadata/filesystem read.
+                value.completion_rechecked = true;
+                value.checkpoint = {};
+                start_checkpoint(value, true);
+                return;
+            }
+            success = false;
+            failure_description = "Torrent completion failed: one or more selected payload files are missing or incomplete after a disk checkpoint and refresh.";
+        }
+        if (success) {
+            cache_final_metadata(value);
+            success = !value.final_metadata.empty();
+            if (!success) failure_description = "Torrent completion failed: selected-file metadata could not be refreshed.";
+        }
+        if (success) {
+            value.final_status = value.handle.status();
+            value.final_resume_data = std::move(value.checkpoint.data);
+            enqueue(id, ltkit::EventMailbox::Kind::completed, "{\"kind\":\"completed\",\"id\":\"" + id
+                + "\",\"status\":" + status_json(*value.final_status) + "}");
+        } else {
+            enqueue(id, ltkit::EventMailbox::Kind::error, "{\"kind\":\"error\",\"id\":\"" + id
+                + "\",\"code\":16,\"description\":\"" + failure_description + "\"}");
+        }
+        engine->remove_torrent(value.handle);
+        value.completion_checkpoint = false;
+        value.stopped = true;
+        value.checkpoint = {};
+        if (success) enqueue(id, ltkit::EventMailbox::Kind::stopped,
+            "{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + id + "\"}");
+    } else if (value.checkpoint.active) {
+        value.checkpoint.done = true;
+        value.checkpoint.error = success ? LTKIT_OK : LTKIT_ERROR_NATIVE_FAILURE;
+    } else {
+        // A timed-out/cancelled caller no longer owns this reply.
+        value.checkpoint = {};
+        start_waiting_completion(value);
+    }
+    condition.notify_all();
+}
+
 extern "C" {
 int32_t ltkit_session_create(ltkit_session_configuration_t const* configuration, ltkit_session_t** output) {
     if (!configuration || !output || !configuration->user_agent || !configuration->ca_bundle_path
@@ -393,7 +468,10 @@ int32_t ltkit_session_create(ltkit_session_configuration_t const* configuration,
         settings.set_bool(lt::settings_pack::enable_natpmp, configuration->enable_natpmp);
         settings.set_bool(lt::settings_pack::validate_https_trackers, true);
         settings.set_int(lt::settings_pack::alert_mask,
-            lt::alert_category::error | lt::alert_category::storage | lt::alert_category::status);
+            // Explicit flush_cache replies are unconditional in pinned libtorrent.
+            // Exclude unsolicited storage/cache alerts so an earlier automatic
+            // flush cannot satisfy a later explicit checkpoint's disk fence.
+            lt::alert_category::error | lt::alert_category::status);
         auto session = std::make_unique<ltkit_session>();
         session->engine = std::make_unique<lt::session>(settings);
         session->alert_thread = std::thread([raw = session.get()] { raw->alerts(); });
@@ -543,6 +621,8 @@ int32_t ltkit_session_select_files(ltkit_session_t* session, char const* identif
         std::lock_guard lock(session->mutex);
         auto* value = find_job(session, identifier);
         if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
+        if (value->completion_checkpoint || value->completion_waiting)
+            return fail(session, LTKIT_ERROR_NATIVE_FAILURE, "The selected files cannot change during torrent completion.");
         if (!value->handle.torrent_file()) return fail(session, LTKIT_ERROR_METADATA_UNAVAILABLE, "Torrent metadata is unavailable.");
         value->desired_files.assign(indexes, indexes + count);
         value->file_priorities.clear();
@@ -562,6 +642,8 @@ int32_t ltkit_session_set_file_priority(
         std::lock_guard lock(session->mutex);
         auto* value = find_job(session, identifier);
         if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
+        if (value->completion_checkpoint || value->completion_waiting)
+            return fail(session, LTKIT_ERROR_NATIVE_FAILURE, "The selected files cannot change during torrent completion.");
         auto info = value->handle.torrent_file();
         if (!info) return fail(session, LTKIT_ERROR_METADATA_UNAVAILABLE, "Torrent metadata is unavailable.");
         auto const count = info->layout().num_files();
@@ -774,13 +856,19 @@ int32_t ltkit_session_checkpoint(
     return guarded(session, [&] {
         std::unique_lock lock(session->mutex);
         auto* value = find_job(session, identifier);
-        if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
-        if (value->checkpoint.active || value->completion_checkpoint)
+        if (!value) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
+        if (value->stopped && !value->final_resume_data.empty()) {
+            if (flush && !ltkit::sync_selected_payloads(value->final_payloads))
+                return fail(session, LTKIT_ERROR_COMPLETION_FAILED, "A selected torrent payload is missing or could not be flushed.");
+            return copy_buffer(value->final_resume_data, output) ? int32_t(LTKIT_OK)
+                : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The checkpoint response could not be allocated.");
+        }
+        if (value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
+        if (value->checkpoint.active || !value->checkpoint.barrier.idle() || value->completion_checkpoint)
             return fail(session, LTKIT_ERROR_NATIVE_FAILURE, "A checkpoint is already pending for this torrent.");
-        value->checkpoint = {.active = true};
-        auto flags = lt::torrent_handle::save_info_dict;
-        if (flush) flags |= lt::torrent_handle::flush_disk_cache;
-        value->handle.save_resume_data(flags);
+        value->checkpoint = {};
+        value->checkpoint.active = true;
+        session->start_checkpoint(*value, flush);
         auto const wake_generation = session->wake_generation;
         auto const completed = session->condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
             auto* current = find_job(session, identifier);
@@ -792,10 +880,9 @@ int32_t ltkit_session_checkpoint(
         if (!completed || interrupted || !value) {
             if (value) {
                 value->checkpoint.active = false;
-                if (value->completion_waiting) {
-                    value->completion_waiting = false;
-                    value->completion_checkpoint = true;
-                    value->handle.save_resume_data(lt::torrent_handle::save_info_dict | lt::torrent_handle::flush_disk_cache);
+                if (value->checkpoint.done) {
+                    value->checkpoint = {};
+                    session->start_waiting_completion(*value);
                 }
             }
             return fail(session, LTKIT_ERROR_TIMED_OUT,
@@ -803,11 +890,7 @@ int32_t ltkit_session_checkpoint(
         }
         auto checkpoint = std::move(value->checkpoint);
         value->checkpoint = {};
-        if (value->completion_waiting) {
-            value->completion_waiting = false;
-            value->completion_checkpoint = true;
-            value->handle.save_resume_data(lt::torrent_handle::save_info_dict | lt::torrent_handle::flush_disk_cache);
-        }
+        session->start_waiting_completion(*value);
         if (checkpoint.error != LTKIT_OK) return fail(session, checkpoint.error, "The checkpoint request failed.");
         return copy_buffer(checkpoint.data, output) ? int32_t(LTKIT_OK)
             : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The checkpoint response could not be allocated.");

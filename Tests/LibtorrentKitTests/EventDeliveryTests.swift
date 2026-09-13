@@ -48,6 +48,10 @@ func slowConsumerRetainsMoreThan256NativeLifecycleEvents() async throws {
             case .completed(let id, let status):
                 #expect(phases[id] == 1)
                 #expect(status.progress == 1)
+                // Automatic handle removal must preserve the durable final
+                // checkpoint for a delayed consumer's accounting/recheck.
+                let checkpoint = try await session.checkpoint(id, flushDiskCache: true)
+                #expect(!checkpoint.isEmpty)
                 phases[id] = 2
             case .stoppedAfterCompletion(let id):
                 #expect(phases[id] == 2)
