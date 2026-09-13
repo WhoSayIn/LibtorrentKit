@@ -58,6 +58,10 @@ LTKIT_EXPORT int32_t ltkit_session_create(
 LTKIT_EXPORT void ltkit_session_wake(ltkit_session_t *session);
 LTKIT_EXPORT void ltkit_session_destroy(ltkit_session_t *session);
 
+// Identifiers are at most 64 bytes. Up to 256 jobs (including removed jobs
+// with undelivered events) may be retained. At capacity, add fails with
+// LTKIT_ERROR_ALLOCATION_LIMIT before starting a torrent; drain events and
+// remove unused jobs before retrying.
 LTKIT_EXPORT int32_t ltkit_session_add(
     ltkit_session_t *session,
     const char *identifier,
@@ -107,6 +111,9 @@ LTKIT_EXPORT int32_t ltkit_session_clear_streaming_window(ltkit_session_t *sessi
 LTKIT_EXPORT int32_t ltkit_session_checkpoint(
     ltkit_session_t *session, const char *identifier, bool flush_disk_cache, int32_t timeout_ms, ltkit_buffer_t *out_data);
 LTKIT_EXPORT int32_t ltkit_session_remove(ltkit_session_t *session, const char *identifier, bool delete_files);
+// Lifecycle/error events are retained in per-torrent order. Status is latest
+// only and piece notifications are omitted; use piece_completion/pieces.
+// Call remove to release a stopped job after reading any cached final status.
 LTKIT_EXPORT int32_t ltkit_session_next_event(ltkit_session_t *session, int32_t timeout_ms, ltkit_buffer_t *out_json);
 LTKIT_EXPORT int32_t ltkit_session_take_last_error(ltkit_session_t *session, ltkit_buffer_t *out_utf8);
 LTKIT_EXPORT void ltkit_buffer_free(ltkit_buffer_t buffer);

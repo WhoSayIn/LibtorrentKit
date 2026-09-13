@@ -144,7 +144,35 @@ Default completion policy is `.stopWithoutDeletingFiles`. On selected-payload
 completion, the bridge emits a completed status, pauses, requests resume data
 with a disk-cache flush, removes the torrent without delete flags, then emits
 `stoppedAfterCompletion`. Its cached status reports zero upload rate, zero
-peers, and no swarm participation. Explicit `.seed` is opt-in.
+peers, and no swarm participation. Final selected-file metadata also remains
+readable until explicit removal, even if the event consumer was delayed.
+Explicit `.seed` is opt-in.
+
+`events` is a single-consumer, demand-driven stream: Swift does not buffer or
+evict native events. The native mailbox retains lifecycle transitions and
+every error occurrence in per-torrent order, separately from one latest status
+per torrent. Repeated identical native errors are stored as a count and read
+back individually; interleaved torrents have no global ordering guarantee.
+One-shot lifecycle notifications are emitted once per added torrent.
+Raw `pieceCompleted` notifications are no longer emitted; use the compact
+`pieceCompletion(for:)` snapshot (or diagnostic `pieces(for:)`).
+
+The mailbox admits at most 256 torrents, reserving their entire lifecycle:
+at most 2,304 critical entries and 256 status snapshots. Admission fails with
+`.allocationLimit` before adding a torrent when full. Call `remove` on unused
+jobs, including automatically stopped jobs after reading their final status.
+Removal frees the native job but retains its pending critical events until
+read; drain those events before reusing the identifier. No event consumer can
+block native checkpoint processing. Shutdown/cancelling the stream explicitly
+ends delivery.
+
+For native development, run `Scripts/build-xcframework.sh`, then
+`Scripts/test-native-events.sh` and
+`LIBTORRENTKIT_USE_LOCAL_NATIVE=1 swift test`. The opt-in flag selects the rebuilt
+local XCFramework; normal package resolution continues to use the published,
+checksum-pinned artifact. The native stress test exceeds both former
+256-event limits with telemetry and errors; the Swift integration test delays
+consumption until 384 real metadata/completion/stop events are pending.
 
 ## iOS backgrounding and sensitive data
 

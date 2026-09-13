@@ -1,6 +1,10 @@
 // swift-tools-version: 6.0
 
 import PackageDescription
+import Foundation
+
+// Rebuild with Scripts/build-xcframework.sh before exercising native changes.
+let useLocalNative = ProcessInfo.processInfo.environment["LIBTORRENTKIT_USE_LOCAL_NATIVE"] == "1"
 
 let package = Package(
     name: "LibtorrentKit",
@@ -12,10 +16,13 @@ let package = Package(
         .library(name: "LibtorrentKit", targets: ["LibtorrentKit"]),
     ],
     targets: [
-        .binaryTarget(
+        useLocalNative ? .binaryTarget(
             name: "LibtorrentNative",
-            url: "https://github.com/WhoSayIn/LibtorrentKit/releases/download/v0.4.0/LibtorrentNative.xcframework.zip",
-            checksum: "dbb8a328a54309ebc4b4bfbb8eeef60eee00acdc39801bc4d5e3b945e9b26c54"
+            path: "Vendor/LibtorrentNative.xcframework"
+        ) : .binaryTarget(
+            name: "LibtorrentNative",
+            url: "https://github.com/WhoSayIn/LibtorrentKit/releases/download/v0.5.0/LibtorrentNative.xcframework.zip",
+            checksum: "efd1b8a72106184f2a42ca6ef704c93f0db7f93af872887075cc21168969d028"
         ),
         .binaryTarget(
             name: "OpenSSL",

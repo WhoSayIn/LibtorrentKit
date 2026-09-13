@@ -1,7 +1,7 @@
 import Foundation
 @preconcurrency import LibtorrentNative
 
-private final class NativeSessionHandle: @unchecked Sendable {
+final class NativeSessionHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: OpaquePointer?
     var pointer: OpaquePointer {
@@ -17,6 +17,10 @@ private final class NativeSessionHandle: @unchecked Sendable {
             return value
         }
         if let value { ltkit_session_destroy(value) }
+    }
+
+    func wake() {
+        lock.withLock { if let storage { ltkit_session_wake(storage) } }
     }
 
     deinit { destroy() }
@@ -46,7 +50,7 @@ private final class NativeOperationCancellation: @unchecked Sendable {
     var isCancelled: Bool { lock.withLock { cancelled } }
 }
 
-private final class NativeSessionExecutor: @unchecked Sendable {
+final class NativeSessionExecutor: @unchecked Sendable {
     private let queue = DispatchQueue(label: "LibtorrentKit.NativeSession", qos: .utility)
     private let native: NativeSessionHandle
 
@@ -88,14 +92,18 @@ private final class NativeSessionExecutor: @unchecked Sendable {
                 }
             }
         } onCancel: { [native] in
-            if cancellation.cancel(), let pointer = native.optionalPointer {
-                ltkit_session_wake(pointer)
-            }
+            if cancellation.cancel() { native.wake() }
+        }
+    }
+
+    func drain() async {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
         }
     }
 
     func shutdown() async {
-        if let pointer = native.optionalPointer { ltkit_session_wake(pointer) }
+        native.wake()
         await withCheckedContinuation { continuation in
             queue.async { [native] in
                 native.destroy()
@@ -123,11 +131,14 @@ private struct TorrentGeometry: Sendable {
 }
 
 public actor TorrentSession {
+    /// A single-consumer, demand-driven stream. Lifecycle/error events remain
+    /// in the bounded native mailbox until read; status is latest per torrent.
+    /// Call `remove` for unused jobs to release their mailbox reservations.
     public nonisolated let events: AsyncStream<TorrentEvent>
 
     private let native: NativeSessionHandle
     private let nativeExecutor: NativeSessionExecutor
-    private let eventTask: Task<Void, Never>
+    private let eventReader: NativeEventReader
     private let checkpointTimeoutMilliseconds: Int32
     private var isShutDown = false
     private var identifiers: Set<UUID> = []
@@ -164,30 +175,12 @@ public actor TorrentSession {
         let milliseconds = components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
         self.checkpointTimeoutMilliseconds = Int32(clamping: milliseconds)
 
-        let (stream, continuation) = AsyncStream<TorrentEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
-        self.events = stream
-        self.eventTask = Task.detached(priority: .utility) {
-            while !Task.isCancelled {
-                guard let pointer = native.optionalPointer else { break }
-                var buffer = ltkit_buffer_t(data: nil, size: 0)
-                let code = ltkit_session_next_event(pointer, 500, &buffer)
-                if code == LTKIT_OK, let data = Self.takeData(&buffer),
-                   let envelope = try? JSONDecoder.ltkit.decode(NativeEventEnvelope.self, from: data),
-                   let event = envelope.event() {
-                    continuation.yield(event)
-                } else if code != LTKIT_ERROR_TIMED_OUT && code != LTKIT_ERROR_SESSION_SHUT_DOWN {
-                    let description = Self.takeNativeError(pointer)
-                    continuation.yield(.error(id: nil, error: .native(operation: .event, code: code, description: description)))
-                }
-            }
-            continuation.finish()
-        }
+        let reader = NativeEventReader(native: native)
+        self.eventReader = reader
+        self.events = AsyncStream(unfolding: { await reader.next() }, onCancel: { reader.close() })
     }
 
-    deinit {
-        eventTask.cancel()
-        if let pointer = native.optionalPointer { ltkit_session_wake(pointer) }
-    }
+    deinit { eventReader.close() }
 
     public func add(_ request: TorrentAddRequest) async throws {
         try ensureRunning(operation: .add)
@@ -400,9 +393,7 @@ public actor TorrentSession {
     public func shutdown() async {
         guard !isShutDown else { return }
         isShutDown = true
-        eventTask.cancel()
-        ltkit_session_wake(native.pointer)
-        await eventTask.value
+        await eventReader.shutdown()
         geometry.removeAll()
         await nativeExecutor.shutdown()
     }

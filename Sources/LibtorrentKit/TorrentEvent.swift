@@ -3,6 +3,8 @@ import Foundation
 public enum TorrentEvent: Sendable, Equatable {
     case metadataReady(id: UUID)
     case statusChanged(id: UUID, status: TorrentStatus)
+    /// Retained for source compatibility. Sessions no longer emit per-piece
+    /// notifications; query `pieceCompletion(for:)` or `pieces(for:)` instead.
     case pieceCompleted(id: UUID, pieceIndex: Int)
     case completed(id: UUID, finalStatus: TorrentStatus)
     case stoppedAfterCompletion(id: UUID)

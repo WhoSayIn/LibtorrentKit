@@ -1,4 +1,5 @@
 #include "LibtorrentNative.h"
+#include "EventMailbox.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -23,7 +24,6 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -43,7 +43,6 @@ using namespace std::chrono_literals;
 namespace {
 constexpr std::size_t kMaxSourceBytes = 64u * 1024u * 1024u;
 constexpr std::size_t kMaxResumeBytes = 64u * 1024u * 1024u;
-constexpr std::size_t kMaxEvents = 256;
 constexpr int kNormalPriority = 4;
 constexpr int kTopPriority = 7;
 
@@ -161,6 +160,7 @@ struct ltkit_session {
         bool completion_waiting = false;
         bool stopped = false;
         std::optional<lt::torrent_status> final_status;
+        std::string final_metadata;
         std::set<int> deadline_pieces;
         checkpoint_state checkpoint;
     };
@@ -169,20 +169,21 @@ struct ltkit_session {
     std::condition_variable_any condition;
     std::unique_ptr<lt::session> engine;
     std::unordered_map<std::string, job> jobs;
-    std::deque<std::string> events;
+    ltkit::EventMailbox events;
     std::string last_error;
     bool shutting_down = false;
     std::uint64_t wake_generation = 0;
     std::thread alert_thread;
+
+    void cache_final_metadata(job& value);
 
     void set_error(std::string value) {
         std::lock_guard lock(mutex);
         last_error = std::move(value);
     }
 
-    void enqueue(std::string event) {
-        if (events.size() == kMaxEvents) events.pop_front();
-        events.push_back(std::move(event));
+    void enqueue(std::string const& id, ltkit::EventMailbox::Kind kind, std::string event) {
+        events.critical(id, kind, std::move(event));
         condition.notify_all();
     }
 
@@ -247,20 +248,18 @@ struct ltkit_session {
                         value.handle.pause();
                         engine->remove_torrent(value.handle);
                         value.stopped = true;
-                        enqueue("{\"type\":\"event\",\"kind\":\"error\",\"id\":\"" + *id
+                        enqueue(*id, ltkit::EventMailbox::Kind::invalid_selection, "{\"type\":\"event\",\"kind\":\"error\",\"id\":\"" + *id
                             + "\",\"code\":7,\"description\":\"A requested file index is invalid.\"}");
                     } else {
-                        enqueue("{\"kind\":\"metadataReady\",\"id\":\"" + *id + "\"}");
+                        enqueue(*id, ltkit::EventMailbox::Kind::metadata, "{\"kind\":\"metadataReady\",\"id\":\"" + *id + "\"}");
                     }
                     condition.notify_all();
-                } else if (auto const* piece = lt::alert_cast<lt::piece_finished_alert>(alert)) {
-                    enqueue("{\"kind\":\"pieceCompleted\",\"id\":\"" + *id
-                        + "\",\"pieceIndex\":" + std::to_string(static_cast<int>(piece->piece_index)) + "}");
                 } else if (lt::alert_cast<lt::torrent_finished_alert>(alert) && value.completion_stops
-                    && value.handle.status().total_wanted > 0) {
+                    && !value.final_status && value.handle.status().total_wanted > 0) {
                     auto status = value.handle.status();
                     value.final_status = status;
-                    enqueue("{\"kind\":\"completed\",\"id\":\"" + *id + "\",\"status\":" + status_json(status) + "}");
+                    cache_final_metadata(value);
+                    enqueue(*id, ltkit::EventMailbox::Kind::completed, "{\"kind\":\"completed\",\"id\":\"" + *id + "\",\"status\":" + status_json(status) + "}");
                     value.handle.pause();
                     if (!value.checkpoint.active) {
                         value.completion_checkpoint = true;
@@ -276,7 +275,7 @@ struct ltkit_session {
                         engine->remove_torrent(value.handle);
                         value.completion_checkpoint = false;
                         value.stopped = true;
-                        enqueue("{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
+                        enqueue(*id, ltkit::EventMailbox::Kind::stopped, "{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
                     }
                     condition.notify_all();
                 } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(alert)) {
@@ -287,15 +286,16 @@ struct ltkit_session {
                         engine->remove_torrent(value.handle);
                         value.completion_checkpoint = false;
                         value.stopped = true;
-                        enqueue("{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
+                        enqueue(*id, ltkit::EventMailbox::Kind::stopped, "{\"kind\":\"stoppedAfterCompletion\",\"id\":\"" + *id + "\"}");
                     }
                     condition.notify_all();
                 } else if (lt::alert_cast<lt::torrent_error_alert>(alert)) {
-                    enqueue("{\"kind\":\"error\",\"id\":\"" + *id
+                    enqueue(*id, ltkit::EventMailbox::Kind::error, "{\"kind\":\"error\",\"id\":\"" + *id
                         + "\",\"code\":12,\"description\":\"The torrent engine reported a recoverable error.\"}");
                 } else if (lt::alert_cast<lt::state_changed_alert>(alert)) {
-                    enqueue("{\"kind\":\"statusChanged\",\"id\":\"" + *id
+                    events.status(*id, "{\"kind\":\"statusChanged\",\"id\":\"" + *id
                         + "\",\"status\":" + status_json(value.handle.status(), value.stopped) + "}");
+                    condition.notify_all();
                 }
             }
         }
@@ -370,6 +370,12 @@ std::string metadata_json(ltkit_session::job& value, bool& safe) {
 }
 }
 
+void ltkit_session::cache_final_metadata(job& value) {
+    bool safe = false;
+    auto metadata = metadata_json(value, safe);
+    if (safe) value.final_metadata = std::move(metadata);
+}
+
 extern "C" {
 int32_t ltkit_session_create(ltkit_session_configuration_t const* configuration, ltkit_session_t** output) {
     if (!configuration || !output || !configuration->user_agent || !configuration->ca_bundle_path
@@ -422,7 +428,7 @@ int32_t ltkit_session_add(
     char const* download_directory, int32_t const* selected_files, size_t selected_count,
     bool has_file_selection, int32_t primary_file, bool begins_paused,
     int32_t download_limit, int32_t upload_limit, int32_t completion_policy) {
-    if (!session || !identifier || !*identifier || !source || source_size == 0 || !download_directory
+    if (!session || !identifier || !*identifier || std::strlen(identifier) > 64 || !source || source_size == 0 || !download_directory
         || source_size > kMaxSourceBytes || resume_size > kMaxResumeBytes || (selected_count > 0 && !selected_files)
         || selected_count > 100000 || primary_file < -1 || completion_policy < 0 || completion_policy > 1)
         return fail(session, LTKIT_ERROR_INVALID_ARGUMENT, "The add request is invalid.");
@@ -430,6 +436,8 @@ int32_t ltkit_session_add(
         std::lock_guard lock(session->mutex);
         if (session->shutting_down) return fail(session, LTKIT_ERROR_SESSION_SHUT_DOWN, "The torrent session has shut down.");
         if (session->jobs.find(identifier) != session->jobs.end()) return fail(session, LTKIT_ERROR_DUPLICATE_IDENTIFIER, "The torrent identifier already exists.");
+        if (!session->events.can_add(identifier))
+            return fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "Drain events and remove unused torrents before adding more torrents.");
         if (!std::filesystem::path(download_directory).is_absolute())
             return fail(session, LTKIT_ERROR_INVALID_ARGUMENT, "The download directory must be absolute.");
 
@@ -484,8 +492,9 @@ int32_t ltkit_session_add(
         value.primary_file = primary_file;
         value.metadata_ready = bool(handle.torrent_file());
         value.completion_stops = completion_policy == 0;
+        session->events.add(identifier);
         session->jobs.emplace(identifier, std::move(value));
-        if (handle.torrent_file()) session->enqueue("{\"kind\":\"metadataReady\",\"id\":\"" + std::string(identifier) + "\"}");
+        if (handle.torrent_file()) session->enqueue(identifier, ltkit::EventMailbox::Kind::metadata, "{\"kind\":\"metadataReady\",\"id\":\"" + std::string(identifier) + "\"}");
         return int32_t(LTKIT_OK);
     });
 }
@@ -495,6 +504,12 @@ int32_t ltkit_session_metadata(ltkit_session_t* session, char const* identifier,
     return guarded(session, [&] {
         std::unique_lock lock(session->mutex);
         auto* value = find_job(session, identifier);
+        // A slow consumer may observe metadata/completion after automatic
+        // handle removal. Keep the selected-file snapshot until explicit remove.
+        if (value && value->stopped && !value->final_metadata.empty()) {
+            return copy_buffer(value->final_metadata, output) ? int32_t(LTKIT_OK)
+                : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The metadata response could not be allocated.");
+        }
         if (!value || value->stopped) return fail(session, LTKIT_ERROR_INVALID_IDENTIFIER, "The torrent identifier is not active.");
         if (!value->metadata_ready) {
             auto const wake_generation = session->wake_generation;
@@ -805,12 +820,12 @@ int32_t ltkit_session_remove(ltkit_session_t* session, char const* identifier, b
         std::lock_guard lock(session->mutex);
         auto* value = find_job(session, identifier);
         if (!value) return int32_t(LTKIT_OK);
-        if (value->stopped) return int32_t(LTKIT_OK);
         if (value->checkpoint.active) return fail(session, LTKIT_ERROR_NATIVE_FAILURE, "The torrent cannot be removed while a checkpoint is pending.");
         auto flags = delete_files ? lt::session::delete_files : lt::remove_flags_t{};
-        session->engine->remove_torrent(value->handle, flags);
-        value->stopped = true;
-        value->deadline_pieces.clear();
+        if (!value->stopped) session->engine->remove_torrent(value->handle, flags);
+        session->events.retire(identifier);
+        session->jobs.erase(identifier);
+        session->condition.notify_all();
         return int32_t(LTKIT_OK);
     });
 }
@@ -819,15 +834,17 @@ int32_t ltkit_session_next_event(ltkit_session_t* session, int32_t timeout_ms, l
     if (!session || !output || timeout_ms < 0) return LTKIT_ERROR_INVALID_ARGUMENT;
     return guarded(session, [&] {
         std::unique_lock lock(session->mutex);
-        if (session->events.empty()) session->condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-            return !session->events.empty() || session->shutting_down;
+        auto const wake_generation = session->wake_generation;
+        if (!session->events.front()) session->condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+            return session->events.front() || session->shutting_down || session->wake_generation != wake_generation;
         });
         if (session->shutting_down) return int32_t(LTKIT_ERROR_SESSION_SHUT_DOWN);
-        if (session->events.empty()) return int32_t(LTKIT_ERROR_TIMED_OUT);
-        auto event = std::move(session->events.front());
-        session->events.pop_front();
-        return copy_buffer(event, output) ? int32_t(LTKIT_OK)
-            : fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The event response could not be allocated.");
+        auto const* event = session->events.front();
+        if (!event) return int32_t(LTKIT_ERROR_TIMED_OUT);
+        if (!copy_buffer(*event, output))
+            return fail(session, LTKIT_ERROR_ALLOCATION_LIMIT, "The event response could not be allocated.");
+        session->events.pop();
+        return int32_t(LTKIT_OK);
     });
 }
 
